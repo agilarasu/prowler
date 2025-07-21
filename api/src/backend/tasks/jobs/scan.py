@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -39,6 +40,45 @@ from prowler.lib.outputs.finding import Finding as ProwlerFinding
 from prowler.lib.scan.scan import Scan as ProwlerScan
 
 logger = get_task_logger(__name__)
+
+
+
+def trigger_dashboard_analytics(serialized_data: dict):
+    """Send serialized scan data to API Gateway when scan completes."""
+    logger.info("Triggering dashboard analytics")
+    
+    try:
+        import requests
+        
+        # API Gateway URL
+        api_gateway_url = 'https://h18sm0pbye.execute-api.us-east-1.amazonaws.com/default/prowler_dashboard_analytics_python'
+        
+        # Prepare payload
+        payload = {
+            'scan_id': serialized_data.get('id', 'unknown'),
+            'tenant_id': serialized_data.get('tenant_id', 'unknown'),
+            'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+            'event_type': 'scan_completed',
+            'scan_data': serialized_data
+        }
+        
+        # Send to API Gateway
+        response = requests.post(
+            api_gateway_url,
+            headers={'Content-Type': 'application/json'},
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Successfully sent scan analytics for scan {payload['scan_id']}")
+        else:
+            logger.error(f"API Gateway returned status {response.status_code}: {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error sending dashboard analytics: {e}")
+    except Exception as e:
+        logger.error(f"Error sending dashboard analytics: {e}")
 
 
 def _create_finding_delta(
@@ -129,6 +169,8 @@ def perform_prowler_scan(
         ValueError: If the provider cannot be connected.
 
     """
+    logger.info(f"Starting scan {scan_id} for provider {provider_id}")
+    
     exception = None
     unique_resources = set()
     scan_resource_cache: set[tuple[str, str, str, str]] = set()
@@ -141,6 +183,7 @@ def perform_prowler_scan(
         scan_instance.state = StateChoices.EXECUTING
         scan_instance.started_at = datetime.now(tz=timezone.utc)
         scan_instance.save()
+        logger.info(f"Scan {scan_id} set to EXECUTING state")
 
     # Find the mutelist processor if it exists
     with rls_transaction(tenant_id):
@@ -346,6 +389,14 @@ def perform_prowler_scan(
                 scan_instance.save()
 
         scan_instance.state = StateChoices.COMPLETED
+        logger.info(f"Scan {scan_id} completed successfully")
+        
+        # Trigger dashboard analytics API Gateway storage
+        try:
+            serializer = ScanTaskSerializer(instance=scan_instance)
+            trigger_dashboard_analytics(serializer.data)
+        except Exception as e:
+            logger.error(f"Dashboard analytics trigger failed: {e}")
 
         # Update failed_findings_count for all resources in batches if scan completed successfully
         if resource_failed_findings_cache:
@@ -392,18 +443,19 @@ def perform_prowler_scan(
             )
             for resource_id, service, region, resource_type in scan_resource_cache
         ]
+        
         with rls_transaction(tenant_id):
             ResourceScanSummary.objects.bulk_create(
                 resource_scan_summaries, batch_size=500, ignore_conflicts=True
             )
+        
     except Exception as filter_exception:
         import sentry_sdk
 
         sentry_sdk.capture_exception(filter_exception)
-        logger.error(
-            f"Error storing filter values for scan {scan_id}: {filter_exception}"
-        )
+        logger.error(f"Error storing resource scan summaries: {filter_exception}")
 
+    # Return the same serialized data that was sent to analytics
     serializer = ScanTaskSerializer(instance=scan_instance)
     return serializer.data
 
