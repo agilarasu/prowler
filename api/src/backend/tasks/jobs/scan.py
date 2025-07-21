@@ -43,23 +43,42 @@ logger = get_task_logger(__name__)
 
 
 
-def trigger_dashboard_analytics(serialized_data: dict):
-    """Send serialized scan data to API Gateway when scan completes."""
+def trigger_dashboard_analytics(tenant_id: str, scan_id: str):
+    """Send scan findings data to API Gateway when scan completes."""
     logger.info("Triggering dashboard analytics")
     
     try:
         import requests
+        from api.v1.serializers import FindingSerializer
         
         # API Gateway URL
         api_gateway_url = 'https://h18sm0pbye.execute-api.us-east-1.amazonaws.com/default/prowler_dashboard_analytics_python'
         
-        # Prepare payload
+        # Get findings for this scan
+        with rls_transaction(tenant_id):
+            findings = Finding.objects.filter(
+                tenant_id=tenant_id, 
+                scan_id=scan_id
+            ).select_related('scan').prefetch_related('resources')
+            
+            # Serialize findings data
+            findings_serializer = FindingSerializer(findings, many=True)
+            findings_data = findings_serializer.data
+            
+            # Get scan metadata
+            scan_instance = Scan.objects.get(pk=scan_id)
+            scan_serializer = ScanTaskSerializer(instance=scan_instance)
+            scan_metadata = scan_serializer.data
+        
+        # Prepare payload with findings
         payload = {
-            'scan_id': serialized_data.get('id', 'unknown'),
-            'tenant_id': serialized_data.get('tenant_id', 'unknown'),
+            'scan_id': scan_id,
+            'tenant_id': tenant_id,
             'timestamp': datetime.now(tz=timezone.utc).isoformat(),
             'event_type': 'scan_completed',
-            'scan_data': serialized_data
+            'scan_metadata': scan_metadata,
+            'findings': findings_data,
+            'findings_count': len(findings_data)
         }
         
         # Send to API Gateway
@@ -71,7 +90,7 @@ def trigger_dashboard_analytics(serialized_data: dict):
         )
         
         if response.status_code == 200:
-            logger.info(f"Successfully sent scan analytics for scan {payload['scan_id']}")
+            logger.info(f"Successfully sent scan analytics with {len(findings_data)} findings for scan {scan_id}")
         else:
             logger.error(f"API Gateway returned status {response.status_code}: {response.text}")
             
@@ -393,8 +412,7 @@ def perform_prowler_scan(
         
         # Trigger dashboard analytics API Gateway storage
         try:
-            serializer = ScanTaskSerializer(instance=scan_instance)
-            trigger_dashboard_analytics(serializer.data)
+            trigger_dashboard_analytics(tenant_id, scan_id)
         except Exception as e:
             logger.error(f"Dashboard analytics trigger failed: {e}")
 
